@@ -1,0 +1,326 @@
+// Package playerlist contains a playerList struct that used to manage player information.
+//
+// The [playerList] contains a list of [PlayerInfo] which is received from server when client join.
+// The playerlist contains every players' information of name, display name, uuid, gamemode, latency, public key, etc.
+// And can be used to render the "TAB List". Other packages may also require playerlist to work,
+// for example, the bot/msg package.
+package playerlist
+
+import (
+	"fmt"
+	"log"
+	"reflect"
+	"time"
+
+	"github.com/google/uuid"
+
+	pk "github.com/Tnze/go-mc/net/packet"
+
+	"github.com/reallyoldfogie/mc-bot-go/bot"
+	"github.com/reallyoldfogie/mc-protocol-go/models"
+)
+
+type PlayerList interface {
+	Get() map[uuid.UUID]*PlayerInfo
+	Set(map[uuid.UUID]*PlayerInfo)
+
+	GetPlayerInfo(uuid.UUID) (*PlayerInfo, bool)
+}
+type playerList struct {
+	playerInfos map[uuid.UUID]*PlayerInfo
+	packetMgr   models.PacketMgr
+}
+
+func New(c bot.Client, packetMgr models.PacketMgr) PlayerList {
+	pl := playerList{
+		playerInfos: make(map[uuid.UUID]*PlayerInfo),
+		packetMgr:   packetMgr,
+	}
+	c.Events().AddListener(
+		bot.PacketHandler{
+			Priority: 64, ID: packetMgr.GetClientboundPacketID("ClientboundPlayerInfoUpdate"),
+			F: pl.handlePlayerInfoUpdatePacket,
+		},
+		bot.PacketHandler{
+			Priority: 64, ID: packetMgr.GetClientboundPacketID("ClientboundPlayerInfoRemove"),
+			F: pl.handlePlayerInfoRemovePacket,
+		},
+	)
+	return &pl
+}
+
+func (pl *playerList) Get() map[uuid.UUID]*PlayerInfo   { return pl.playerInfos }
+func (pl *playerList) Set(in map[uuid.UUID]*PlayerInfo) { pl.playerInfos = in }
+
+func (pl *playerList) handlePlayerInfoUpdatePacket(p pk.Packet) error {
+	// Get version-specific packet using PacketMgr
+	packetID := pl.packetMgr.GetClientboundPacketID("ClientboundPlayerInfoUpdate")
+	packet, err := pl.packetMgr.GetClientboundPacketByID(packetID)
+	if err != nil {
+		return fmt.Errorf("failed to get ClientboundPlayerInfo packet: %w", err)
+	}
+	if err := packet.Scan(p); err != nil {
+		return fmt.Errorf("failed to scan ClientboundPlayerInfo packet: %w", err)
+	}
+
+	// Get fields via version-agnostic interface
+	fields := packet.GetFields()
+	action, ok := fields["Action"]
+	if !ok {
+		return fmt.Errorf("packet missing Action field")
+	}
+	data, ok := fields["Data"]
+	if !ok {
+		return fmt.Errorf("packet missing Data field")
+	}
+
+	// Use reflection to access the action bitflags methods
+	actionVal := reflect.ValueOf(action)
+	getAddPlayer := actionVal.MethodByName("AddPlayer")
+	getInitializeChat := actionVal.MethodByName("InitializeChat")
+	getUpdateGameMode := actionVal.MethodByName("UpdateGameMode")
+	getUpdateListed := actionVal.MethodByName("UpdateListed")
+	getUpdateLatency := actionVal.MethodByName("UpdateLatency")
+	getUpdateDisplayName := actionVal.MethodByName("UpdateDisplayName")
+
+	// Get the array via reflection
+	dataVal := reflect.ValueOf(data)
+	getMethod := dataVal.MethodByName("Get")
+	if !getMethod.IsValid() {
+		return fmt.Errorf("Data field has no Get() method")
+	}
+	results := getMethod.Call(nil)
+	if len(results) == 0 {
+		return fmt.Errorf("Data.Get() returned no results")
+	}
+
+	// The result should be a pointer to a slice
+	playerArrayPtr := results[0]
+	if playerArrayPtr.Kind() != reflect.Ptr || playerArrayPtr.Elem().Kind() != reflect.Slice {
+		return fmt.Errorf("Data.Get() did not return pointer to slice")
+	}
+	playerArray := playerArrayPtr.Elem()
+
+	// Process each player in the data array
+	for i := 0; i < playerArray.Len(); i++ {
+		playerData := playerArray.Index(i)
+		// Get Uuid field
+		uuidField := playerData.FieldByName("Uuid")
+		if !uuidField.IsValid() {
+			continue
+		}
+		id := uuid.UUID(uuidField.Interface().(pk.UUID))
+
+		player, ok := pl.playerInfos[id]
+		if !ok { // create new player info if not exist
+			player = new(PlayerInfo)
+			pl.playerInfos[id] = player
+		}
+
+		// add player (action bit 0)
+		if getAddPlayer.IsValid() && getAddPlayer.Call(nil)[0].Bool() {
+			playerField := playerData.FieldByName("Player")
+			if !playerField.IsValid() {
+				continue
+			}
+			log.Printf("[PlayerList] Action.AddPlayer() is true, Player field type: %T, value: %+v", playerField.Interface(), playerField.Interface())
+
+			// Try to extract game profile via reflection
+			if playerField.Kind() == reflect.Ptr && !playerField.IsNil() {
+				gameProfile := playerField.Elem()
+				nameFld := gameProfile.FieldByName("Name")
+				propsFld := gameProfile.FieldByName("Properties")
+
+				if nameFld.IsValid() && propsFld.IsValid() {
+					name := string(nameFld.Interface().(pk.String))
+
+					// Get properties array
+					propsGetMethod := propsFld.MethodByName("Get")
+					var properties []Property
+					if propsGetMethod.IsValid() {
+						propsResults := propsGetMethod.Call(nil)
+						if len(propsResults) > 0 {
+							propsPtr := propsResults[0]
+							if propsPtr.Kind() == reflect.Ptr && !propsPtr.IsNil() {
+								propsSlice := propsPtr.Elem()
+								if propsSlice.Kind() == reflect.Slice {
+									properties = make([]Property, propsSlice.Len())
+									for j := 0; j < propsSlice.Len(); j++ {
+										prop := propsSlice.Index(j)
+										propName := prop.FieldByName("Name")
+										propValue := prop.FieldByName("Value")
+										propSig := prop.FieldByName("Signature")
+										if propName.IsValid() && propValue.IsValid() {
+											properties[j] = Property{
+												Name:  string(propName.Interface().(pk.String)),
+												Value: string(propValue.Interface().(pk.String)),
+											}
+											if propSig.IsValid() {
+												// Signature is Option[String]
+												hasField := propSig.FieldByName("Has")
+												valField := propSig.FieldByName("Val")
+												if hasField.IsValid() && valField.IsValid() && hasField.Bool() && !valField.IsNil() {
+													properties[j].Signature = string(valField.Elem().Interface().(pk.String))
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+					player.GameProfile = GameProfile{
+						ID:         id,
+						Name:       name,
+						Properties: properties,
+					}
+					log.Printf("[PlayerList] Added player %q (UUID: %s)", player.Name, id.String())
+				}
+			}
+		}
+
+		// initialize chat (action bit 1)
+		if getInitializeChat.IsValid() && getInitializeChat.Call(nil)[0].Bool() {
+			// ChatSession data structure changed in 1.21.5
+			// For now, just set a flag that chat is initialized
+			player.HasChatSession = true
+		}
+
+		// update gamemode (action bit 2)
+		if getUpdateGameMode.IsValid() && getUpdateGameMode.Call(nil)[0].Bool() {
+			gamemodeFld := playerData.FieldByName("Gamemode")
+			if gamemodeFld.IsValid() && gamemodeFld.Kind() == reflect.Ptr && !gamemodeFld.IsNil() {
+				if gamemode, ok := gamemodeFld.Interface().(*pk.VarInt); ok {
+					player.Gamemode = int32(*gamemode)
+				}
+			}
+		}
+
+		// update listed (action bit 3)
+		if getUpdateListed.IsValid() && getUpdateListed.Call(nil)[0].Bool() {
+			listedFld := playerData.FieldByName("Listed")
+			if listedFld.IsValid() && listedFld.Kind() == reflect.Ptr && !listedFld.IsNil() {
+				if listed, ok := listedFld.Interface().(*pk.VarInt); ok {
+					// Protocol sends VarInt (0 or 1) but we store as bool
+					player.Listed = *listed != 0
+				}
+			}
+		}
+
+		// update latency (action bit 4)
+		if getUpdateLatency.IsValid() && getUpdateLatency.Call(nil)[0].Bool() {
+			latencyFld := playerData.FieldByName("Latency")
+			if latencyFld.IsValid() && latencyFld.Kind() == reflect.Ptr && !latencyFld.IsNil() {
+				if latency, ok := latencyFld.Interface().(*pk.VarInt); ok {
+					player.Latency = int32(*latency)
+				}
+			}
+		}
+
+		// display name (action bit 5)
+		if getUpdateDisplayName.IsValid() && getUpdateDisplayName.Call(nil)[0].Bool() {
+			displayNameFld := playerData.FieldByName("DisplayName")
+			if displayNameFld.IsValid() && displayNameFld.Kind() == reflect.Ptr && !displayNameFld.IsNil() {
+				// DisplayName is Option<AnonymousNBT> which represents a chat component
+				// Check if it has the Has field
+				displayName := displayNameFld.Elem()
+				hasField := displayName.FieldByName("Has")
+				if hasField.IsValid() && hasField.Bool() {
+					// TODO: Parse NBT to extract display name text
+					player.DisplayName = "<has display name>"
+				} else {
+					player.DisplayName = ""
+				}
+			}
+		}
+
+		// update_hat (action bit 6) - added in 1.21.5
+		// Currently not stored in PlayerInfo struct
+
+		// update_list_order (action bit 7) - added in 1.21.5
+		// Currently not stored in PlayerInfo struct
+	}
+
+	return nil
+}
+
+func (pl *playerList) handlePlayerInfoRemovePacket(p pk.Packet) error {
+	// Get version-specific packet using PacketMgr
+	packetID := pl.packetMgr.GetClientboundPacketID("ClientboundPlayerInfoRemove")
+	packet, err := pl.packetMgr.GetClientboundPacketByID(packetID)
+	if err != nil {
+		return fmt.Errorf("failed to get ClientboundPlayerRemove packet: %w", err)
+	}
+	if err := packet.Scan(p); err != nil {
+		return fmt.Errorf("failed to scan ClientboundPlayerRemove packet: %w", err)
+	}
+
+	// Get Players field via version-agnostic interface
+	fields := packet.GetFields()
+	playersField, ok := fields["Players"]
+	if !ok {
+		return fmt.Errorf("packet missing Players field")
+	}
+
+	// Use reflection to call Get() method
+	playersVal := reflect.ValueOf(playersField)
+	getMethod := playersVal.MethodByName("Get")
+	if !getMethod.IsValid() {
+		return fmt.Errorf("Players field has no Get() method")
+	}
+	results := getMethod.Call(nil)
+	if len(results) == 0 {
+		return fmt.Errorf("Players.Get() returned no results")
+	}
+
+	// The result should be a pointer to a slice of UUIDs
+	uuidsPtr := results[0]
+	if uuidsPtr.Kind() != reflect.Ptr || uuidsPtr.Elem().Kind() != reflect.Slice {
+		return fmt.Errorf("Players.Get() did not return pointer to slice")
+	}
+	uuidsSlice := uuidsPtr.Elem()
+
+	// Remove each player from the list
+	for i := 0; i < uuidsSlice.Len(); i++ {
+		playerUUID := uuidsSlice.Index(i).Interface().(pk.UUID)
+		delete(pl.playerInfos, uuid.UUID(playerUUID))
+	}
+	return nil
+}
+
+type PlayerInfo struct {
+	GameProfile
+	HasChatSession bool
+	Gamemode       int32
+	Latency        int32
+	Listed         bool
+	DisplayName    string
+}
+
+type GameProfile struct {
+	ID         uuid.UUID
+	Name       string
+	Properties []Property
+}
+
+type Property struct {
+	Name      string
+	Value     string
+	Signature string
+}
+
+// GetPlayerInfo returns player information for the given UUID.
+// Returns the PlayerInfo and true if found, or nil and false if not found.
+func (pl *playerList) GetPlayerInfo(id uuid.UUID) (*PlayerInfo, bool) {
+	info, ok := pl.playerInfos[id]
+	return info, ok
+}
+
+// LegacyChatSession provides backward compatibility for packages expecting sign.Session.
+// This is a temporary adapter until all code is migrated away from Tnze/go-mc types.
+type LegacyChatSession struct {
+	SessionID uuid.UUID
+	ExpireAt  time.Time
+	PublicKey []byte
+	Signature []byte
+}
