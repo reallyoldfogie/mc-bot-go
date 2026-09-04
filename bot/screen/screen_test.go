@@ -8,9 +8,56 @@ import (
 	"testing"
 
 	pk "github.com/Tnze/go-mc/net/packet"
+	v1_21_1 "github.com/reallyoldfogie/mc-protocol-go/data/1.21.1"
+	basetypesPreHash "github.com/reallyoldfogie/mc-protocol-go/data/1.21.1/basetypes"
+	v1_21_5 "github.com/reallyoldfogie/mc-protocol-go/data/1.21.5"
 	"github.com/reallyoldfogie/mc-protocol-go/data/1.21.5/basetypes"
+	"github.com/reallyoldfogie/mc-protocol-go/models"
 	"github.com/stretchr/testify/require"
 )
+
+// TestUsesHashedItemSlots and the plainSlotFromSlot/buildPlainContainerClick
+// tests below cover the pre-1.21.5 container_click fix: before it,
+// ContainerClick unconditionally sent the 1.21.5+ HashedSlot wire format to
+// every version, which a pre-1.21.5 server can't decode and disconnects
+// the client for — found live via mc-agent's testing/craft_test.go failing
+// specifically against 1.21.1.
+func TestUsesHashedItemSlots(t *testing.T) {
+	oldMgr := &manager{packetMgr: v1_21_1.Packets{}}
+	require.False(t, oldMgr.usesHashedItemSlots(), "1.21.1 (protocol 767) should use the pre-1.21.5 plain-Slot format")
+
+	newMgr := &manager{packetMgr: v1_21_5.Packets{}}
+	require.True(t, newMgr.usesHashedItemSlots(), "1.21.5 (protocol 770) should use the HashedSlot format")
+
+	nilMgr := &manager{}
+	require.True(t, nilMgr.usesHashedItemSlots(), "a nil packetMgr should preserve the prior (hashed) behavior")
+}
+
+func TestPlainSlotFromSlot_EmptySlot(t *testing.T) {
+	for _, slot := range []*Slot{nil, {Count: 0}} {
+		got, err := plainSlotFromSlot(slot)
+		require.NoError(t, err)
+		require.Equal(t, pk.VarInt(0), got.ItemCount)
+		_, isVoid := got.UnnamedType0001.(*models.Void)
+		require.True(t, isVoid, "empty slot should encode as ItemCount=0 with a Void payload")
+	}
+}
+
+func TestPlainSlotFromSlot_SimpleItem(t *testing.T) {
+	got, err := plainSlotFromSlot(&Slot{ID: 36, Count: 2})
+	require.NoError(t, err)
+	require.Equal(t, pk.VarInt(2), got.ItemCount)
+	def, ok := got.UnnamedType0001.(*basetypesPreHash.SlotUnnamedType0001Default)
+	require.True(t, ok, "non-empty slot should encode as SlotUnnamedType0001Default, got %T", got.UnnamedType0001)
+	require.Equal(t, pk.VarInt(36), def.ItemId)
+	require.Equal(t, pk.VarInt(0), def.AddedComponentCount)
+	require.Equal(t, pk.VarInt(0), def.RemovedComponentCount)
+}
+
+func TestPlainSlotFromSlot_RejectsComponentsRatherThanSendingThemWrong(t *testing.T) {
+	_, err := plainSlotFromSlot(&Slot{ID: 5, Count: 1, Components: []SlotComponent{{Type: 1, Data: pk.VarInt(1)}}})
+	require.Error(t, err, "an item carrying components must error, not be silently sent as if it had none")
+}
 
 func TestSlotReadFromComponents(t *testing.T) {
 	var damageTypeID int64 = -1

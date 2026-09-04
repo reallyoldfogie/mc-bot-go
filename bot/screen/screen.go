@@ -14,6 +14,8 @@ import (
 	"github.com/Tnze/go-mc/chat"
 	pk "github.com/Tnze/go-mc/net/packet"
 	"github.com/reallyoldfogie/mc-bot-go/bot"
+	basetypesPreHash "github.com/reallyoldfogie/mc-protocol-go/data/1.21.1/basetypes"
+	serverboundPreHash "github.com/reallyoldfogie/mc-protocol-go/data/1.21.1/play/serverbound"
 	"github.com/reallyoldfogie/mc-protocol-go/data/1.21.5/basetypes"
 	"github.com/reallyoldfogie/mc-protocol-go/data/1.21.5/play/serverbound"
 	"github.com/reallyoldfogie/mc-protocol-go/models"
@@ -146,48 +148,62 @@ func (m *manager) SetInventory(in Inventory) {
 
 type ChangedSlots map[int]*Slot
 
+// hashedSlotProtocolThreshold is 1.21.5's protocol version number
+// (models.PacketMgr.VersionProtocol()). ServerboundContainerClick's item
+// slot encoding changed at exactly this version: pre-1.21.5 clients send a
+// full item Slot (a plain item-count/id/component switch, matching
+// data/1.21.1/basetypes.Slot); 1.21.5 and later send an
+// Option[HashedSlot] — a presence flag plus a component-hash-only summary
+// (data/1.21.5/basetypes.HashedSlot) — a real Mojang protocol rework, not
+// an artifact of this codebase. Verified directly against
+// data/1.21.1..1.21.4's generated WindowClick struct (all four use the
+// plain-Slot shape; 1.21.1's protocol number 767 is used below as the
+// representative "old" wire format for that whole range) versus
+// data/1.21.5 and later (all HashedSlot). Numeric protocol version is used
+// rather than the human version string specifically to avoid a semver/
+// lexicographic-comparison bug ("1.21.10" < "1.21.2" as plain strings).
+//
+// Found live: before this fix, ContainerClick unconditionally built and
+// sent the 1.21.5+ HashedSlot-shaped packet for every version, including
+// pre-1.21.5 servers — which fails to decode it
+// ("DecoderException: Failed to decode packet
+// 'serverbound/minecraft:container_click'") and disconnects the client.
+// Discovered via mc-agent's testing/craft_test.go (a new inventory-click
+// live test, the first in that codebase to exercise a full pickup/place
+// sequence against every supported version) failing specifically and only
+// against 1.21.1.
+const hashedSlotProtocolThreshold = 770
+
+func (m *manager) usesHashedItemSlots() bool {
+	if m.packetMgr == nil {
+		return true // preserve prior (1.21.5+) behavior if no version info is available
+	}
+	return m.packetMgr.VersionProtocol() >= hashedSlotProtocolThreshold
+}
+
 func (m *manager) ContainerClick(id int, slot int16, button byte, mode int32, slots ChangedSlots, carried *Slot) error {
-	packet := serverbound.NewWindowClick()
-	packet.SetPacketID(int32(m.packetMgr.GetServerboundPacketID("ServerboundContainerClick")))
-	packet.WindowId = basetypes.ContainerID(id)
-
-	m.mu.RLock()
-	packet.StateId = pk.VarInt(m.stateID)
-	m.mu.RUnlock()
-
-	packet.Slot = pk.Short(slot)
-	packet.MouseButton = pk.Byte(button)
-	packet.Mode = pk.VarInt(mode)
-
-	changedSlots := make([]serverbound.WindowClickChangedSlotsArrayType, 0, len(slots))
-	for location, slotData := range slots {
-		itemOpt, err := hashedSlotOption(slotData)
-		if err != nil {
-			return err
-		}
-		changedSlots = append(changedSlots, serverbound.WindowClickChangedSlotsArrayType{
-			Location: pk.Short(location),
-			Item:     itemOpt,
-		})
-	}
-	packet.ChangedSlots = models.Array[pk.VarInt, serverbound.WindowClickChangedSlotsArrayType]{
-		Ary: models.Ary[pk.VarInt]{Ary: &changedSlots},
-	}
-
-	cursorItem, err := hashedSlotOption(carried)
-	if err != nil {
-		return err
-	}
-	packet.CursorItem = cursorItem
-
 	m.mu.RLock()
 	stateID := m.stateID
 	m.mu.RUnlock()
 
+	var (
+		packet    pk.Packet
+		cursorHas bool
+		err       error
+	)
+	if m.usesHashedItemSlots() {
+		packet, cursorHas, err = m.buildHashedContainerClick(id, slot, button, mode, slots, carried, stateID)
+	} else {
+		packet, cursorHas, err = m.buildPlainContainerClick(id, slot, button, mode, slots, carried, stateID)
+	}
+	if err != nil {
+		return err
+	}
+
 	if debugPath := os.Getenv("MC_AGENT_CLICK_DEBUG_PATH"); debugPath != "" {
 		if f, err := os.OpenFile(debugPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
 			fmt.Fprintf(f, "[%s] container_click window=%d state=%d slot=%d button=%d mode=%d changed=%d cursorHas=%t\n",
-				time.Now().Format(time.RFC3339Nano), id, stateID, slot, button, mode, len(slots), cursorItem.Has)
+				time.Now().Format(time.RFC3339Nano), id, stateID, slot, button, mode, len(slots), cursorHas)
 			for location, slotData := range slots {
 				fmt.Fprintf(f, "\tchanged slot=%d id=%d count=%d components=%d removes=%d\n",
 					location, slotData.ID, slotData.Count, len(slotData.Components), len(slotData.RemoveComponents))
@@ -201,7 +217,7 @@ func (m *manager) ContainerClick(id int, slot int16, button byte, mode int32, sl
 		}
 	}
 
-	if err := m.c.Conn().WritePacket(packet.Marshal()); err != nil {
+	if err := m.c.Conn().WritePacket(packet); err != nil {
 		return err
 	}
 
@@ -218,6 +234,82 @@ func (m *manager) ContainerClick(id int, slot int16, button byte, mode int32, sl
 	return nil
 }
 
+// buildHashedContainerClick builds a ServerboundContainerClick packet using
+// the 1.21.5+ HashedSlot item-slot encoding. This is the packet shape that
+// was, prior to this fix, used unconditionally for every version.
+func (m *manager) buildHashedContainerClick(id int, slot int16, button byte, mode int32, slots ChangedSlots, carried *Slot, stateID int32) (pk.Packet, bool, error) {
+	packet := serverbound.NewWindowClick()
+	packet.SetPacketID(int32(m.packetMgr.GetServerboundPacketID("ServerboundContainerClick")))
+	packet.WindowId = basetypes.ContainerID(id)
+	packet.StateId = pk.VarInt(stateID)
+	packet.Slot = pk.Short(slot)
+	packet.MouseButton = pk.Byte(button)
+	packet.Mode = pk.VarInt(mode)
+
+	changedSlots := make([]serverbound.WindowClickChangedSlotsArrayType, 0, len(slots))
+	for location, slotData := range slots {
+		itemOpt, err := hashedSlotOption(slotData)
+		if err != nil {
+			return pk.Packet{}, false, err
+		}
+		changedSlots = append(changedSlots, serverbound.WindowClickChangedSlotsArrayType{
+			Location: pk.Short(location),
+			Item:     itemOpt,
+		})
+	}
+	packet.ChangedSlots = models.Array[pk.VarInt, serverbound.WindowClickChangedSlotsArrayType]{
+		Ary: models.Ary[pk.VarInt]{Ary: &changedSlots},
+	}
+
+	cursorItem, err := hashedSlotOption(carried)
+	if err != nil {
+		return pk.Packet{}, false, err
+	}
+	packet.CursorItem = cursorItem
+
+	return packet.Marshal(), bool(cursorItem.Has), nil
+}
+
+// buildPlainContainerClick builds a ServerboundContainerClick packet using
+// the pre-1.21.5 plain-Slot item-slot encoding (see
+// hashedSlotProtocolThreshold's doc comment). Uses data/1.21.1's generated
+// WindowClick struct as the representative "old" wire format for the whole
+// 1.21.1-1.21.4 range (all four versions share this exact shape for this
+// packet, verified directly).
+func (m *manager) buildPlainContainerClick(id int, slot int16, button byte, mode int32, slots ChangedSlots, carried *Slot, stateID int32) (pk.Packet, bool, error) {
+	packet := serverboundPreHash.NewWindowClick()
+	packet.SetPacketID(int32(m.packetMgr.GetServerboundPacketID("ServerboundContainerClick")))
+	packet.WindowId = basetypesPreHash.ContainerID(id)
+	packet.StateId = pk.VarInt(stateID)
+	packet.Slot = pk.Short(slot)
+	packet.MouseButton = pk.Byte(button)
+	packet.Mode = pk.VarInt(mode)
+
+	changedSlots := make([]serverboundPreHash.WindowClickChangedSlotsArrayType, 0, len(slots))
+	for location, slotData := range slots {
+		item, err := plainSlotFromSlot(slotData)
+		if err != nil {
+			return pk.Packet{}, false, err
+		}
+		changedSlots = append(changedSlots, serverboundPreHash.WindowClickChangedSlotsArrayType{
+			Location: pk.Short(location),
+			Item:     item,
+		})
+	}
+	packet.ChangedSlots = models.Array[pk.VarInt, serverboundPreHash.WindowClickChangedSlotsArrayType]{
+		Ary: models.Ary[pk.VarInt]{Ary: &changedSlots},
+	}
+
+	cursorItem, err := plainSlotFromSlot(carried)
+	if err != nil {
+		return pk.Packet{}, false, err
+	}
+	packet.CursorItem = cursorItem
+
+	cursorHas := carried != nil && carried.Count > 0
+	return packet.Marshal(), cursorHas, nil
+}
+
 func hashedSlotOption(slot *Slot) (models.Option[basetypes.HashedSlot], error) {
 	if slot == nil || slot.Count <= 0 {
 		return models.Option[basetypes.HashedSlot]{Has: false}, nil
@@ -227,6 +319,45 @@ func hashedSlotOption(slot *Slot) (models.Option[basetypes.HashedSlot], error) {
 		return models.Option[basetypes.HashedSlot]{Has: false}, err
 	}
 	return models.Option[basetypes.HashedSlot]{Has: true, Val: &hashed}, nil
+}
+
+// plainSlotFromSlot converts this package's local Slot into the pre-1.21.5
+// wire-format Slot (data/1.21.1/basetypes.Slot, representative of the whole
+// 1.21.1-1.21.4 range — see hashedSlotProtocolThreshold). An empty/nil slot
+// encodes as ItemCount=0 with a Void payload, matching how the older
+// protocol represents "no item" (there's no separate presence flag the way
+// HashedSlot's Option wrapper has — emptiness is intrinsic to Slot itself).
+//
+// Known gap, not solved here: items carrying components (enchantments,
+// custom names, written-book contents, etc.) are rejected with an error
+// rather than sent incorrectly. The pre-1.21.5 wire format encodes each
+// component's actual data with a per-component-type switch (varint, bool,
+// anonymous NBT, ...), unlike 1.21.5+'s uniform hash-only representation —
+// correctly reproducing that would need a real per-component encoder, a
+// meaningfully larger undertaking than fixing plain item movement (the vast
+// majority of inventory interactions — ordinary stackable items with no
+// attached data). Revisit if a live test needs to move a
+// component-bearing item on a pre-1.21.5 server.
+func plainSlotFromSlot(slot *Slot) (basetypesPreHash.Slot, error) {
+	if slot == nil || slot.Count <= 0 {
+		return basetypesPreHash.Slot{
+			ItemCount:       0,
+			UnnamedType0001: &models.Void{},
+		}, nil
+	}
+	if len(slot.Components) > 0 || len(slot.RemoveComponents) > 0 {
+		return basetypesPreHash.Slot{}, fmt.Errorf(
+			"plainSlotFromSlot: item components on pre-1.21.5 container clicks are not supported yet (item id %d carries %d component(s), %d removal(s))",
+			slot.ID, len(slot.Components), len(slot.RemoveComponents))
+	}
+	return basetypesPreHash.Slot{
+		ItemCount: pk.VarInt(slot.Count),
+		UnnamedType0001: &basetypesPreHash.SlotUnnamedType0001Default{
+			ItemId:                pk.VarInt(slot.ID),
+			AddedComponentCount:   0,
+			RemovedComponentCount: 0,
+		},
+	}, nil
 }
 
 func hashedSlotFromSlot(slot *Slot) (basetypes.HashedSlot, error) {
