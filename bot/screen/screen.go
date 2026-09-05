@@ -1,6 +1,7 @@
 package screen
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -55,11 +56,28 @@ type manager struct {
 	serverUpdateVersion int64
 
 	packetMgr models.PacketMgr
+
+	// registrySyncOnce guards the one-time population of liveContainerTypes
+	// from the connected server's "minecraft:menu" registry data (see
+	// populateContainerTypesFromLiveRegistry in registry_loader.go).
+	registrySyncOnce sync.Once
+	// liveContainerTypes holds container-type metadata derived from the
+	// server this manager is actually connected to, keyed by protocol ID.
+	// Consulted before the hardcoded package-level containerTypeRegistry
+	// fallback; protected by mu like the other manager fields.
+	liveContainerTypes map[int32]ContainerTypeInfo
+
+	// slotCodec, when set, provides exact per-version Slot (de)serialization
+	// in place of the built-in pre/post-1.21.5 heuristic (see SlotCodec's
+	// doc comment). Set once in NewManager from c.VersionHandler(); never
+	// mutated afterward, so no lock is needed to read it.
+	slotCodec SlotCodec
 }
 
 func NewManager(c bot.Client, e ContainerEventsListener, packetMgr models.PacketMgr) Manager {
 	if packetMgr != nil {
 		models.SetCurrentNBTVersion(packetMgr.Name())
+		SetCurrentSlotComponentEncoding(packetMgr.VersionProtocol() >= hashedSlotProtocolThreshold)
 	}
 	m := &manager{
 		c:         c,
@@ -67,6 +85,11 @@ func NewManager(c bot.Client, e ContainerEventsListener, packetMgr models.Packet
 		inventory: NewInventory(),
 		events:    e,
 		packetMgr: packetMgr,
+	}
+	if vh := c.VersionHandler(); vh != nil {
+		if sc, ok := vh.(SlotCodec); ok {
+			m.slotCodec = sc
+		}
 	}
 	m.screens[0] = m.inventory
 
@@ -186,20 +209,7 @@ func (m *manager) ContainerClick(id int, slot int16, button byte, mode int32, sl
 	stateID := m.stateID
 	m.mu.RUnlock()
 
-	var (
-		packet    pk.Packet
-		cursorHas bool
-		err       error
-	)
-	if m.usesHashedItemSlots() {
-		packet, cursorHas, err = m.buildHashedContainerClick(id, slot, button, mode, slots, carried, stateID)
-	} else {
-		packet, cursorHas, err = m.buildPlainContainerClick(id, slot, button, mode, slots, carried, stateID)
-	}
-	if err != nil {
-		return err
-	}
-
+	cursorHas := carried != nil && carried.Count > 0
 	if debugPath := os.Getenv("MC_AGENT_CLICK_DEBUG_PATH"); debugPath != "" {
 		if f, err := os.OpenFile(debugPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
 			fmt.Fprintf(f, "[%s] container_click window=%d state=%d slot=%d button=%d mode=%d changed=%d cursorHas=%t\n",
@@ -217,8 +227,26 @@ func (m *manager) ContainerClick(id int, slot int16, button byte, mode int32, sl
 		}
 	}
 
-	if err := m.c.Conn().WritePacket(packet); err != nil {
-		return err
+	if m.slotCodec != nil {
+		if err := m.slotCodec.SendContainerClick(m.c.Conn(), id, stateID, slot, button, mode, slots, carried); err != nil {
+			return err
+		}
+	} else {
+		var (
+			packet pk.Packet
+			err    error
+		)
+		if m.usesHashedItemSlots() {
+			packet, _, err = m.buildHashedContainerClick(id, slot, button, mode, slots, carried, stateID)
+		} else {
+			packet, _, err = m.buildPlainContainerClick(id, slot, button, mode, slots, carried, stateID)
+		}
+		if err != nil {
+			return err
+		}
+		if err := m.c.Conn().WritePacket(packet); err != nil {
+			return err
+		}
 	}
 
 	// CRITICAL: Increment state ID locally after sending the packet
@@ -431,13 +459,16 @@ func (m *manager) onOpenScreen(p pk.Packet) error {
 		return Error{err}
 	}
 
+	m.registrySyncOnce.Do(m.populateContainerTypesFromLiveRegistry)
+
 	fmt.Printf("[onOpenScreen] ← Received ClientboundOpenScreen: windowID=%d type=%d title=%q\n",
 		ContainerID, Type, Title.String())
 
 	TypeInt32 := int32(Type)
 
-	// Look up container type info from registry
-	typeInfo, ok := GetContainerTypeInfo(TypeInt32)
+	// Look up container type info: the live server registry first, falling
+	// back to the hardcoded package-level defaults.
+	typeInfo, ok := m.getContainerTypeInfo(TypeInt32)
 	if !ok {
 		// Unknown container type - log warning but don't fail
 		// This allows forward compatibility with future Minecraft versions
@@ -545,18 +576,36 @@ func (m *manager) onOpenHorseScreen(p pk.Packet) error {
 }
 
 func (m *manager) onSetContentPacket(p pk.Packet) error {
-	var (
-		containerID pk.VarInt
-		stateID     pk.VarInt
-		slotData    Slots
-		carriedItem Slot
-	)
-	if err := p.Scan(
-		&containerID,
-		&stateID,
-		pk.Array(&slotData),
-		&carriedItem,
-	); err != nil {
+	// Read containerID/stateID/slotCount the same way p.Scan would (a
+	// single bytes.Reader over p.Data, fields read in order -- see
+	// go-mc's Packet.Scan), then take over reading the Slot-typed fields
+	// ourselves via m.decodeSlot so a SlotCodec (if any) actually gets
+	// used for them.
+	r := bytes.NewReader(p.Data)
+
+	var containerID, stateID, slotCount pk.VarInt
+	if _, err := containerID.ReadFrom(r); err != nil {
+		return Error{err}
+	}
+	if _, err := stateID.ReadFrom(r); err != nil {
+		return Error{err}
+	}
+	if _, err := slotCount.ReadFrom(r); err != nil {
+		return Error{err}
+	}
+	if slotCount < 0 {
+		return Error{errors.New("negative slot count in ClientboundContainerSetContent")}
+	}
+	slotData := make(Slots, slotCount)
+	for i := range slotData {
+		s, err := m.decodeSlot(r)
+		if err != nil {
+			return Error{err}
+		}
+		slotData[i] = s
+	}
+	carriedItem, err := m.decodeSlot(r)
+	if err != nil {
 		return Error{err}
 	}
 
@@ -710,13 +759,21 @@ func getScreenIDs(screens map[int]Container) []int {
 }
 
 func (m *manager) OnSetSlot(p pk.Packet) (err error) {
-	var (
-		containerID pk.VarInt
-		stateID     pk.VarInt
-		slotID      pk.Short
-		slotData    Slot
-	)
-	if err := p.Scan(&containerID, &stateID, &slotID, &slotData); err != nil {
+	r := bytes.NewReader(p.Data)
+
+	var containerID, stateID pk.VarInt
+	var slotID pk.Short
+	if _, err := containerID.ReadFrom(r); err != nil {
+		return Error{err}
+	}
+	if _, err := stateID.ReadFrom(r); err != nil {
+		return Error{err}
+	}
+	if _, err := slotID.ReadFrom(r); err != nil {
+		return Error{err}
+	}
+	slotData, err := m.decodeSlot(r)
+	if err != nil {
 		return Error{err}
 	}
 
@@ -754,11 +811,14 @@ func (m *manager) OnSetSlot(p pk.Packet) (err error) {
 }
 
 func (m *manager) onSetPlayerInventory(p pk.Packet) (err error) {
-	var (
-		SlotID   pk.VarInt
-		SlotData Slot
-	)
-	if err := p.Scan(&SlotID, &SlotData); err != nil {
+	r := bytes.NewReader(p.Data)
+
+	var SlotID pk.VarInt
+	if _, err := SlotID.ReadFrom(r); err != nil {
+		return Error{err}
+	}
+	SlotData, err := m.decodeSlot(r)
+	if err != nil {
 		return Error{err}
 	}
 

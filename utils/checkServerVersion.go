@@ -162,6 +162,13 @@ func getServerInfo(ctx context.Context, addr string, protocolVersion uint, conn 
 		}
 	}
 
+	// Handshake packet ID (0x00) and the status-state packet IDs below are
+	// literals rather than resolved via a packetMgr: unlike every other
+	// protocol phase, these have never changed across any Minecraft
+	// version, so there's nothing version-specific to resolve here
+	// (bot/mcbot.go's own join() handshake does the same for this reason).
+	// protocolVersion itself is already an explicit parameter, so this
+	// function can already probe a server declaring any version.
 	const Handshake = 0x00
 	// 握手
 	err = conn.WritePacket(pk.Marshal(

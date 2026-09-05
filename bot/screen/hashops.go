@@ -7,10 +7,12 @@ import (
 	"math"
 	"reflect"
 	"sort"
+	"sync/atomic"
 	"unicode/utf16"
 
 	pk "github.com/Tnze/go-mc/net/packet"
 	"github.com/google/uuid"
+	basetypesPreHash "github.com/reallyoldfogie/mc-protocol-go/data/1.21.1/basetypes"
 	"github.com/reallyoldfogie/mc-protocol-go/data/1.21.5/basetypes"
 	"github.com/reallyoldfogie/mc-protocol-go/models"
 )
@@ -37,34 +39,78 @@ const (
 	hashTagLongArrayEnd   = 19
 )
 
+// The slot component name<->ID tables are version-dependent, same as the
+// Slot/HashedSlot wire format switch in screen.go: pre-1.21.5 servers use
+// data/1.21.1's component numbering, 1.21.5+ servers use data/1.21.5's.
+// This mirrors that fix's exact representative-version split (see
+// hashedSlotProtocolThreshold's doc comment in screen.go) rather than
+// tracking every individual version, since Slot.WriteTo/ReadFrom (screen.go)
+// implement pk.Field and have no way to receive a packetMgr through their
+// io.Reader/io.Writer-only signatures.
 var (
-	componentTypeNameToID = buildComponentTypeNameToID()
-	componentTypeIDToName = buildComponentTypeIDToName()
+	componentTypeNameToIDPostHash = buildComponentTypeNameToID(basetypes.SlotComponentTypeMappings)
+	componentTypeIDToNamePostHash = buildComponentTypeIDToName(basetypes.SlotComponentTypeMappings)
+	componentTypeNameToIDPreHash  = buildComponentTypeNameToID(basetypesPreHash.SlotComponentTypeMappings)
+	componentTypeIDToNamePreHash  = buildComponentTypeIDToName(basetypesPreHash.SlotComponentTypeMappings)
 )
 
-func buildComponentTypeNameToID() map[string]int32 {
-	m := make(map[string]int32, len(basetypes.SlotComponentTypeMappings))
-	for id, name := range basetypes.SlotComponentTypeMappings {
+// currentSlotComponentUsesHashedTable selects which table componentTypeID/
+// componentTypeName use. It mirrors mc-protocol-go/models.SetCurrentNBTVersion's
+// atomic.Pointer + nil-means-default pattern, for the same reason: nil means
+// "unset", defaulting to the post-hash (1.21.5+) table to preserve this
+// package's original, single-version behavior for callers (including
+// existing tests) that never call SetCurrentSlotComponentEncoding.
+var currentSlotComponentUsesHashedTable atomic.Pointer[bool]
+
+// SetCurrentSlotComponentEncoding selects the slot-component name<->ID table
+// used by componentTypeID/componentTypeName (and therefore Slot.WriteTo/
+// ReadFrom). NewManager calls this using the same hashedSlotProtocolThreshold
+// check as usesHashedItemSlots, so it tracks whatever version this manager's
+// packetMgr reports. Process-wide, like the NBT version it's modeled after:
+// see the "Known limitation" note for Phase 2 in
+// docs/plans/version-awareness-gaps.md.
+func SetCurrentSlotComponentEncoding(usesHashed bool) {
+	currentSlotComponentUsesHashedTable.Store(&usesHashed)
+}
+
+func slotComponentUsesHashedTable() bool {
+	if v := currentSlotComponentUsesHashedTable.Load(); v != nil {
+		return *v
+	}
+	return true // default: preserve historical (1.21.5+) behavior when unset
+}
+
+func buildComponentTypeNameToID(mappings map[int64]string) map[string]int32 {
+	m := make(map[string]int32, len(mappings))
+	for id, name := range mappings {
 		m[name] = int32(id)
 	}
 	return m
 }
 
-func buildComponentTypeIDToName() map[int32]string {
-	m := make(map[int32]string, len(basetypes.SlotComponentTypeMappings))
-	for id, name := range basetypes.SlotComponentTypeMappings {
+func buildComponentTypeIDToName(mappings map[int64]string) map[int32]string {
+	m := make(map[int32]string, len(mappings))
+	for id, name := range mappings {
 		m[int32(id)] = name
 	}
 	return m
 }
 
 func componentTypeID(name string) (int32, bool) {
-	id, ok := componentTypeNameToID[name]
+	if slotComponentUsesHashedTable() {
+		id, ok := componentTypeNameToIDPostHash[name]
+		return id, ok
+	}
+	id, ok := componentTypeNameToIDPreHash[name]
 	return id, ok
 }
 
 func componentTypeName(id int32) (string, bool) {
-	name, ok := componentTypeIDToName[id]
+	if slotComponentUsesHashedTable() {
+		name, ok := componentTypeIDToNamePostHash[id]
+		return name, ok
+	}
+	name, ok := componentTypeIDToNamePreHash[id]
 	return name, ok
 }
 

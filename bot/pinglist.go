@@ -17,31 +17,55 @@ import (
 // PingAndList check server status and list online player.
 // Returns a JSON data with server status, and the delay.
 //
+// This always declares protocol version [ProtocolVersion] (1.21.1) in the
+// handshake. Most servers respond to a status request the same way
+// regardless of the declared version, but if you need to ping as a specific
+// version (e.g. because the target server customizes its status response
+// based on it), use [PingAndListVersion] instead.
+//
 // For more information for JSON format, see https://wiki.vg/Server_List_Ping#Response
 func PingAndList(addr string) ([]byte, time.Duration, error) {
+	return PingAndListVersion(addr, ProtocolVersion)
+}
+
+// PingAndListVersion is [PingAndList] with an explicit protocol version to
+// declare in the handshake, for pinging as a specific Minecraft version.
+func PingAndListVersion(addr string, protocolVersion int32) ([]byte, time.Duration, error) {
 	conn, err := mcnet.DialMC(addr)
 	if err != nil {
 		return nil, 0, LoginErr{"dial connection", err}
 	}
-	return pingAndList(context.Background(), addr, conn)
+	return pingAndList(context.Background(), addr, protocolVersion, conn)
 }
 
 // PingAndListTimeout is the version of PingAndList with max request time.
 func PingAndListTimeout(addr string, timeout time.Duration) ([]byte, time.Duration, error) {
+	return PingAndListVersionTimeout(addr, ProtocolVersion, timeout)
+}
+
+// PingAndListVersionTimeout is [PingAndListTimeout] with an explicit
+// protocol version to declare in the handshake.
+func PingAndListVersionTimeout(addr string, protocolVersion int32, timeout time.Duration) ([]byte, time.Duration, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return PingAndListContext(ctx, addr)
+	return PingAndListVersionContext(ctx, addr, protocolVersion)
 }
 
 func PingAndListContext(ctx context.Context, addr string) ([]byte, time.Duration, error) {
+	return PingAndListVersionContext(ctx, addr, ProtocolVersion)
+}
+
+// PingAndListVersionContext is [PingAndListContext] with an explicit
+// protocol version to declare in the handshake.
+func PingAndListVersionContext(ctx context.Context, addr string, protocolVersion int32) ([]byte, time.Duration, error) {
 	conn, err := mcnet.DefaultDialer.DialMCContext(ctx, addr)
 	if err != nil {
 		return nil, 0, err
 	}
-	return pingAndList(ctx, addr, conn)
+	return pingAndList(ctx, addr, protocolVersion, conn)
 }
 
-func pingAndList(ctx context.Context, addr string, conn *mcnet.Conn) (data []byte, delay time.Duration, err error) {
+func pingAndList(ctx context.Context, addr string, protocolVersion int32, conn *mcnet.Conn) (data []byte, delay time.Duration, err error) {
 	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
 		if err := conn.Socket.SetDeadline(deadline); err != nil {
 			return nil, 0, err
@@ -78,11 +102,17 @@ func pingAndList(ctx context.Context, addr string, conn *mcnet.Conn) (data []byt
 		}
 	}
 
+	// Handshake packet ID (0x00) and the status-state packet IDs below
+	// (packetid.ServerboundStatusStatusRequest/PingRequest) are literals
+	// rather than resolved via a packetMgr: unlike every other protocol
+	// phase, these have never changed across any Minecraft version, so
+	// there's nothing version-specific to resolve (bot/mcbot.go's own
+	// join() handshake does the same for this reason).
 	const Handshake = 0x00
 	// 握手
 	err = conn.WritePacket(pk.Marshal(
 		Handshake,                  // Handshake packet ID
-		pk.VarInt(ProtocolVersion), // Protocol version
+		pk.VarInt(protocolVersion), // Protocol version
 		pk.String(host),            // Server's address
 		pk.UnsignedShort(port),
 		pk.Byte(1),

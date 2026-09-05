@@ -56,6 +56,89 @@ var containerMetadata = map[string]struct {
 	"minecraft:stonecutter":       {2, true, 36},
 }
 
+// buildContainerTypesFromRegistryEntries maps "minecraft:menu" registry
+// entries (name -> protocol ID) to ContainerTypeInfo using the known
+// container shapes in containerMetadata. Names with no known shape are
+// returned separately rather than silently dropped, so callers can log a
+// warning for forward-compat: a container type a newer Minecraft version
+// added that this binary doesn't know the layout of yet.
+func buildContainerTypesFromRegistryEntries(entries map[string]int32) (map[int32]ContainerTypeInfo, []string) {
+	result := make(map[int32]ContainerTypeInfo, len(entries))
+	var unknown []string
+	for name, id := range entries {
+		metadata, ok := containerMetadata[name]
+		if !ok {
+			unknown = append(unknown, name)
+			continue
+		}
+		result[id] = ContainerTypeInfo{
+			Identifier:      name,
+			ContainerSlots:  metadata.ContainerSlots,
+			IncludesPlayer:  metadata.IncludesPlayer,
+			PlayerSlotCount: metadata.PlayerSlotCount,
+		}
+	}
+	return result, unknown
+}
+
+// populateContainerTypesFromLiveRegistry populates m.liveContainerTypes from
+// the "minecraft:menu" registry the connected server actually sent during
+// configuration (bot/configuration.go). This is the authoritative source
+// for the version actually being played, unlike the hardcoded
+// containerTypeRegistry fallback (see generic_container.go) which reflects
+// a single version's snapshot. It's a no-op if the client has no such
+// registry (e.g. offline/replay use, or a server that omits it).
+//
+// Called lazily (via manager.registrySyncOnce) from onOpenScreen rather than
+// from NewManager, since NewManager may run before JoinServer completes
+// configuration; onOpenScreen can only fire after configuration has
+// finished, so the registry data (if any) is guaranteed to already be
+// populated by then.
+func (m *manager) populateContainerTypesFromLiveRegistry() {
+	if m.c == nil {
+		return
+	}
+	registries := m.c.RegistryData()
+	menu, ok := registries["minecraft:menu"]
+	if !ok || menu == nil {
+		return
+	}
+
+	entries := make(map[string]int32, len(menu.Entries))
+	for _, entry := range menu.Entries {
+		if entry != nil {
+			entries[entry.Name] = entry.ID
+		}
+	}
+
+	local, unknown := buildContainerTypesFromRegistryEntries(entries)
+	if len(local) == 0 {
+		return
+	}
+
+	m.mu.Lock()
+	m.liveContainerTypes = local
+	m.mu.Unlock()
+
+	fmt.Printf("[registry_loader] Registered %d container types from live server registry data (minecraft:menu)\n", len(local))
+	if len(unknown) > 0 {
+		fmt.Printf("[registry_loader] Warning: %d unknown container type(s) in server registry (no known shape): %v\n", len(unknown), unknown)
+	}
+}
+
+// getContainerTypeInfo looks up container-type metadata, preferring the
+// live server registry data (see populateContainerTypesFromLiveRegistry)
+// over the hardcoded package-level fallback.
+func (m *manager) getContainerTypeInfo(typeID int32) (ContainerTypeInfo, bool) {
+	m.mu.RLock()
+	info, ok := m.liveContainerTypes[typeID]
+	m.mu.RUnlock()
+	if ok {
+		return info, true
+	}
+	return GetContainerTypeInfo(typeID)
+}
+
 // LoadContainerTypesFromRegistry loads container type IDs from a Minecraft registries.json file
 // and updates the containerTypeRegistry with the correct protocol IDs for the current version.
 //

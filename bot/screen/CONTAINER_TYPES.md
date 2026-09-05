@@ -2,22 +2,58 @@
 
 ## Overview
 
-The screen manager now supports all Minecraft container types through a dynamic registry system.
+The screen manager supports all Minecraft container types through a dynamic
+registry system. Container-type protocol IDs are **not** stable across
+Minecraft versions (e.g. `minecraft:furnace`'s ID can differ between
+versions), so each `manager` prefers the live `"minecraft:menu"` registry
+data the connected server actually sent during configuration, falling back
+to a hardcoded single-version snapshot only when that data isn't available
+(offline/replay use, or a server that omits the registry).
 
 ## Implementation
 
-### Files Modified
+### Files
 
-1. **`generic_container.go`** (NEW)
+1. **`generic_container.go`**
    - `GenericContainer` struct for all non-chest container types
    - `ContainerTypeInfo` struct with metadata for each container type
-   - `containerTypeRegistry` map with all 25 standard container types (0-24)
-   - `RegisterContainerType()` function for dynamic registration of future types
+   - `containerTypeRegistry` — a hardcoded **fallback** snapshot of one
+     version's (1.21.5, protocol 770) 25 standard container types (0-24),
+     guarded by `containerTypeRegistryMu` since it can be written at runtime
+   - `RegisterContainerType()` function for dynamic registration of future
+     types into that fallback
 
-2. **`screen.go`**
-   - Updated `onOpenScreen()` to use the container type registry
+2. **`registry_loader.go`**
+   - `buildContainerTypesFromRegistryEntries()` — pure mapping from
+     `name -> protocol ID` (as sent by the server) to `ContainerTypeInfo`
+     using the known container shapes (`containerMetadata`)
+   - `manager.populateContainerTypesFromLiveRegistry()` — reads the
+     connected server's `"minecraft:menu"` registry (via
+     `bot.Client.RegistryData()`) into that manager's own
+     `liveContainerTypes` map; called once per manager, lazily, from
+     `onOpenScreen` (registry data is only guaranteed to have arrived by the
+     time a `ClientboundOpenScreen` packet can be received)
+   - `manager.getContainerTypeInfo()` — checks `liveContainerTypes` first,
+     then falls back to the package-level `containerTypeRegistry`
+   - `LoadContainerTypesFromRegistry()` — still available for pre-loading
+     the package-level fallback from a `registries.json` file (offline
+     tooling; unrelated to the live-registry path above)
+
+3. **`screen.go`**
+   - `onOpenScreen()` uses `manager.getContainerTypeInfo()` (live registry
+     first, hardcoded fallback second) instead of the package-level function
+     directly
    - Dynamically allocates correct slot count for each container type
    - Maintains backward compatibility with Chest type for types 0-5
+
+### Known limitation
+
+The package-level fallback (`containerTypeRegistry`) is still process-wide:
+if two bots in the same process are connected to different server versions
+*and* both hit a container type their live registry data didn't cover, they
+share the same fallback table. This only affects the fallback path — each
+manager's live registry data (the common case) is already per-connection
+and correct.
 
 ### Supported Container Types
 

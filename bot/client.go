@@ -51,6 +51,12 @@ type Client interface {
 	SetJoinLogin(func(conn *mcnet.Conn) error)
 	SetJoinConfiguration(func(conn *mcnet.Conn) error)
 	SetVersionHandler(VersionHandler)
+	// VersionHandler returns whatever was last passed to SetVersionHandler,
+	// or nil if it was never called. Lets other packages (e.g. bot/screen)
+	// check whether the caller-supplied VersionHandler also implements a
+	// more specific interface of their own (an optional-interface pattern,
+	// same idea as this package's own login/config VersionHandler split).
+	VersionHandler() VersionHandler
 
 	MovementMirror() MovementMirror
 	RegistryCallback() RegistryDataCallback
@@ -169,6 +175,7 @@ func (c *client) MovementMirror() MovementMirror         { return c.movementMirr
 func (c *client) RegistryCallback() RegistryDataCallback { return c.registryCallback }
 func (c *client) PacketMgr() models.PacketMgr            { return c.packetMgr }
 func (c *client) SetVersionHandler(vh VersionHandler)    { c.versionHandler = vh }
+func (c *client) VersionHandler() VersionHandler         { return c.versionHandler }
 
 // Conn is a concurrently-safe wrapper of net.Conn with packet queue.
 // Note that not all methods are concurrently-safe.

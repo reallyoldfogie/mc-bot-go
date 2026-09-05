@@ -2,6 +2,7 @@ package screen
 
 import (
 	"errors"
+	"sync"
 
 	"github.com/Tnze/go-mc/chat"
 	gomc_inventory "github.com/Tnze/go-mc/data/inventory"
@@ -65,8 +66,20 @@ func (c ContainerTypeInfo) TotalSlots() int {
 	return c.ContainerSlots
 }
 
-// containerTypeRegistry maps container type IDs to their metadata
-// Based on https://minecraft.wiki/w/Java_Edition_protocol/Inventory
+// containerTypeRegistryMu guards containerTypeRegistry. It's process-wide
+// state that can now be written at runtime (see populateContainerTypesFromLiveRegistry
+// in registry_loader.go) rather than only during start-of-day file loading,
+// so concurrent access is a real possibility, not just a theoretical one.
+var containerTypeRegistryMu sync.RWMutex
+
+// containerTypeRegistry maps container type IDs to their metadata.
+// This is a hardcoded snapshot of one version's (1.21.5, protocol 770)
+// container-type protocol IDs — see https://minecraft.wiki/w/Java_Edition_protocol/Inventory.
+// It only serves as a fallback: manager.getContainerTypeInfo (screen.go)
+// prefers the "minecraft:menu" registry data the connected server actually
+// sent, which is authoritative for whatever version is actually being
+// played. This map matters when that data isn't available (e.g. a server
+// that omits the registry, or offline/replay use with no live connection).
 var containerTypeRegistry = map[int32]ContainerTypeInfo{
 	// Chest variants (9xN)
 	0: {"generic_9x1", 9, true, 36},
@@ -101,6 +114,8 @@ var containerTypeRegistry = map[int32]ContainerTypeInfo{
 // GetContainerTypeInfo returns metadata for a container type ID
 // Returns ok=false if the type is unknown
 func GetContainerTypeInfo(typeID int32) (ContainerTypeInfo, bool) {
+	containerTypeRegistryMu.RLock()
+	defer containerTypeRegistryMu.RUnlock()
 	info, ok := containerTypeRegistry[typeID]
 	return info, ok
 }
@@ -108,6 +123,8 @@ func GetContainerTypeInfo(typeID int32) (ContainerTypeInfo, bool) {
 // RegisterContainerType allows dynamic registration of new container types
 // This enables support for future Minecraft versions without code changes
 func RegisterContainerType(typeID int32, info ContainerTypeInfo) {
+	containerTypeRegistryMu.Lock()
+	defer containerTypeRegistryMu.Unlock()
 	containerTypeRegistry[typeID] = info
 }
 
@@ -119,6 +136,8 @@ func GetContainerTypeIDByIdentifier(identifier string) int32 {
 		identifier = identifier[10:]
 	}
 
+	containerTypeRegistryMu.RLock()
+	defer containerTypeRegistryMu.RUnlock()
 	for typeID, info := range containerTypeRegistry {
 		// Strip "minecraft:" prefix from registry identifier if present
 		registryID := info.Identifier

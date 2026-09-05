@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"encoding/binary"
 	"hash/crc32"
+	"io"
 	"math"
 	"testing"
 
 	pk "github.com/Tnze/go-mc/net/packet"
+	"github.com/reallyoldfogie/mc-bot-go/bot"
 	v1_21_1 "github.com/reallyoldfogie/mc-protocol-go/data/1.21.1"
 	basetypesPreHash "github.com/reallyoldfogie/mc-protocol-go/data/1.21.1/basetypes"
 	v1_21_5 "github.com/reallyoldfogie/mc-protocol-go/data/1.21.5"
@@ -213,4 +215,294 @@ func utf16EncodeRune(r rune) (uint16, uint16) {
 	hi := uint16(0xD800 + (r >> 10))
 	lo := uint16(0xDC00 + (r & 0x3FF))
 	return hi, lo
+}
+
+// fakeSlotCodec is a minimal SlotCodec for tests. Embedding it in a fake
+// bot.VersionHandler (see fakeVersionHandlerWithCodec) is enough to make
+// that handler satisfy screen.SlotCodec too.
+type fakeSlotCodec struct {
+	decodeCalls int
+	decodeSlot  Slot
+	decodeErr   error
+
+	sendContainerClickCalls int
+	sendContainerClickErr   error
+	lastWindowID            int
+	lastStateID             int32
+	lastSlot                int16
+	lastButton              byte
+	lastMode                int32
+	lastChangedSlots        ChangedSlots
+	lastCursor              *Slot
+}
+
+func (f *fakeSlotCodec) DecodeSlot(r io.Reader) (Slot, int64, error) {
+	f.decodeCalls++
+	return f.decodeSlot, 0, f.decodeErr
+}
+
+func (f *fakeSlotCodec) SendContainerClick(conn bot.PacketWriter, windowID int, stateID int32, slot int16, button byte, mode int32, changedSlots ChangedSlots, cursor *Slot) error {
+	f.sendContainerClickCalls++
+	f.lastWindowID = windowID
+	f.lastStateID = stateID
+	f.lastSlot = slot
+	f.lastButton = button
+	f.lastMode = mode
+	f.lastChangedSlots = changedSlots
+	f.lastCursor = cursor
+	return f.sendContainerClickErr
+}
+
+// fakeVersionHandlerWithCodec satisfies bot.VersionHandler (the minimum
+// needed to be set via Client.SetVersionHandler) and, via the embedded
+// fakeSlotCodec, screen.SlotCodec too -- covering the optional-interface
+// pattern NewManager uses to pick one up.
+type fakeVersionHandlerWithCodec struct {
+	fakeSlotCodec
+}
+
+func (f *fakeVersionHandlerWithCodec) Version() string                        { return "test-version" }
+func (f *fakeVersionHandlerWithCodec) Login() bot.LoginHandler                { return nil }
+func (f *fakeVersionHandlerWithCodec) Configuration() bot.ConfigurationHandler { return nil }
+
+// fakeVersionHandlerWithoutCodec satisfies bot.VersionHandler but not
+// SlotCodec, covering the case where a caller sets a VersionHandler for
+// login/configuration only.
+type fakeVersionHandlerWithoutCodec struct{}
+
+func (f *fakeVersionHandlerWithoutCodec) Version() string                        { return "test-version" }
+func (f *fakeVersionHandlerWithoutCodec) Login() bot.LoginHandler                { return nil }
+func (f *fakeVersionHandlerWithoutCodec) Configuration() bot.ConfigurationHandler { return nil }
+
+// TestNewManager_PicksUpSlotCodecFromVersionHandler covers NewManager's
+// optional-interface detection: a VersionHandler set via
+// Client.SetVersionHandler that also implements SlotCodec should end up on
+// manager.slotCodec.
+func TestNewManager_PicksUpSlotCodecFromVersionHandler(t *testing.T) {
+	packetMgr := v1_21_1.Packets{}
+	client := bot.NewClient(packetMgr)
+	fakeVH := &fakeVersionHandlerWithCodec{}
+	client.SetVersionHandler(fakeVH)
+
+	mgr := NewManager(client, nil, packetMgr)
+	m, ok := mgr.(*manager)
+	require.True(t, ok)
+	require.Equal(t, SlotCodec(fakeVH), m.slotCodec)
+}
+
+// TestNewManager_NoSlotCodecWhenNotProvided covers the two cases where
+// manager.slotCodec must stay nil: no VersionHandler set at all, and one
+// set that doesn't implement SlotCodec.
+func TestNewManager_NoSlotCodecWhenNotProvided(t *testing.T) {
+	packetMgr := v1_21_1.Packets{}
+
+	t.Run("no VersionHandler set", func(t *testing.T) {
+		client := bot.NewClient(packetMgr)
+		mgr := NewManager(client, nil, packetMgr)
+		m, ok := mgr.(*manager)
+		require.True(t, ok)
+		require.Nil(t, m.slotCodec)
+	})
+
+	t.Run("VersionHandler without SlotCodec", func(t *testing.T) {
+		client := bot.NewClient(packetMgr)
+		client.SetVersionHandler(&fakeVersionHandlerWithoutCodec{})
+		mgr := NewManager(client, nil, packetMgr)
+		m, ok := mgr.(*manager)
+		require.True(t, ok)
+		require.Nil(t, m.slotCodec)
+	})
+}
+
+// TestContainerClick_UsesSlotCodecWhenSet covers ContainerClick delegating
+// whole-packet construction to SlotCodec.SendContainerClick when one is
+// set, instead of the built-in buildHashedContainerClick/
+// buildPlainContainerClick -- needed because more than just the item slot
+// encoding differs by version (e.g. the window ID field is a plain byte
+// pre-1.21.5 and a VarInt from 1.21.5 on), so a codec must own the entire
+// packet, not just per-item encoding.
+func TestContainerClick_UsesSlotCodecWhenSet(t *testing.T) {
+	fake := &fakeSlotCodec{}
+	client := bot.NewClient(v1_21_1.Packets{})
+	m := &manager{c: client, slotCodec: fake}
+
+	carried := &Slot{ID: 7, Count: 1}
+	changed := ChangedSlots{2: {ID: 5, Count: 3}}
+	err := m.ContainerClick(9, 4, 1, 2, changed, carried)
+	require.NoError(t, err)
+
+	require.Equal(t, 1, fake.sendContainerClickCalls)
+	require.Equal(t, 9, fake.lastWindowID)
+	require.Equal(t, int32(0), fake.lastStateID)
+	require.Equal(t, int16(4), fake.lastSlot)
+	require.Equal(t, byte(1), fake.lastButton)
+	require.Equal(t, int32(2), fake.lastMode)
+	require.Equal(t, changed, fake.lastChangedSlots)
+	require.Same(t, carried, fake.lastCursor)
+	require.Equal(t, int32(1), m.stateID, "stateID must still advance on the codec path")
+}
+
+// TestOnSetContentPacket_DecodesEmptySlotsWithoutCodec is a regression test
+// for rewriting onSetContentPacket from p.Scan(..., pk.Array(&slotData),
+// &carriedItem) to manual bytes.Reader + per-slot decodeSlot calls (needed
+// so a SlotCodec, when present, actually gets used) -- confirms the manual
+// version still parses containerID/stateID/slot-count/slots/carried
+// identically to before for the no-codec (built-in Slot.ReadFrom) path.
+func TestOnSetContentPacket_DecodesEmptySlotsWithoutCodec(t *testing.T) {
+	chest := &Chest{Slots: make([]Slot, 2)}
+	m := &manager{
+		screens:   map[int]Container{5: chest},
+		inventory: NewInventory(),
+	}
+
+	// containerID=5, stateID=5, slotCount=2, two empty slots (itemCount=0,
+	// encoded as a single zero varint byte each), empty carried item.
+	raw := []byte{0x05, 0x05, 0x02, 0x00, 0x00, 0x00}
+	err := m.onSetContentPacket(pk.Packet{Data: raw})
+	require.NoError(t, err)
+	require.Equal(t, int32(5), m.stateID)
+	require.Equal(t, pk.VarInt(0), chest.Slots[0].Count)
+	require.Equal(t, pk.VarInt(0), chest.Slots[1].Count)
+	require.Equal(t, pk.VarInt(0), m.cursor.Count)
+}
+
+// TestOnSetContentPacket_UsesSlotCodecWhenSet covers the codec dispatch
+// itself: every Slot-shaped field (each array element plus the carried
+// item) must go through SlotCodec.DecodeSlot when one is set.
+func TestOnSetContentPacket_UsesSlotCodecWhenSet(t *testing.T) {
+	fake := &fakeSlotCodec{decodeSlot: Slot{ID: 99, Count: 3}}
+	chest := &Chest{Slots: make([]Slot, 2)}
+	m := &manager{
+		screens:   map[int]Container{5: chest},
+		inventory: NewInventory(),
+		slotCodec: fake,
+	}
+
+	raw := []byte{0x05, 0x05, 0x02, 0x00, 0x00, 0x00} // trailing zero bytes are unused: fake.DecodeSlot ignores r
+	err := m.onSetContentPacket(pk.Packet{Data: raw})
+	require.NoError(t, err)
+	require.Equal(t, 3, fake.decodeCalls, "2 array slots + 1 carried item")
+	require.Equal(t, pk.VarInt(99), chest.Slots[0].ID)
+	require.Equal(t, pk.VarInt(99), chest.Slots[1].ID)
+	require.Equal(t, pk.VarInt(99), m.cursor.ID)
+}
+
+// TestOnSetSlot_UsesSlotCodecWhenSet covers the same dispatch for OnSetSlot
+// (ClientboundContainerSetSlot).
+func TestOnSetSlot_UsesSlotCodecWhenSet(t *testing.T) {
+	fake := &fakeSlotCodec{decodeSlot: Slot{ID: 42, Count: 1}}
+	chest := &Chest{Slots: make([]Slot, 2)}
+	m := &manager{
+		screens:   map[int]Container{5: chest},
+		inventory: NewInventory(),
+		slotCodec: fake,
+	}
+
+	// containerID=5 (varint), stateID=1 (varint), slotID=0 (pk.Short, 2
+	// bytes big-endian), then the (ignored by fake) slot bytes.
+	raw := []byte{0x05, 0x01, 0x00, 0x00, 0x00}
+	err := m.OnSetSlot(pk.Packet{Data: raw})
+	require.NoError(t, err)
+	require.Equal(t, 1, fake.decodeCalls)
+	require.Equal(t, pk.VarInt(42), chest.Slots[0].ID)
+}
+
+// TestOnSetPlayerInventory_UsesSlotCodecWhenSet covers the same dispatch
+// for onSetPlayerInventory (ClientboundSetPlayerInventory).
+func TestOnSetPlayerInventory_UsesSlotCodecWhenSet(t *testing.T) {
+	fake := &fakeSlotCodec{decodeSlot: Slot{ID: 7, Count: 1}}
+	m := &manager{inventory: NewInventory()}
+	m.slotCodec = fake
+
+	// slotID=0 (varint), then the (ignored by fake) slot bytes.
+	raw := []byte{0x00, 0x00}
+	err := m.onSetPlayerInventory(pk.Packet{Data: raw})
+	require.NoError(t, err)
+	require.Equal(t, 1, fake.decodeCalls)
+	require.Equal(t, pk.VarInt(7), m.inventory.GetSlots()[0].ID)
+}
+
+// TestComponentTypeMapping_VersionSplit covers the pre/post-1.21.5 slot
+// component mapping fix: type ID 10 means "can_place_on" pre-1.21.5 but
+// "enchantments" post-1.21.5 (component IDs were renumbered when the
+// HashedSlot rework landed), so using the wrong table silently produces the
+// wrong component.
+func TestComponentTypeMapping_VersionSplit(t *testing.T) {
+	prev := currentSlotComponentUsesHashedTable.Load()
+	defer func() { currentSlotComponentUsesHashedTable.Store(prev) }()
+
+	SetCurrentSlotComponentEncoding(false) // pre-1.21.5
+	name, ok := componentTypeName(10)
+	require.True(t, ok)
+	require.Equal(t, "can_place_on", name)
+	id, ok := componentTypeID("can_place_on")
+	require.True(t, ok)
+	require.Equal(t, int32(10), id)
+
+	SetCurrentSlotComponentEncoding(true) // 1.21.5+
+	name, ok = componentTypeName(10)
+	require.True(t, ok)
+	require.Equal(t, "enchantments", name)
+	id, ok = componentTypeID("enchantments")
+	require.True(t, ok)
+	require.Equal(t, int32(10), id)
+}
+
+// TestSlotComponentUsesHashedTable_DefaultsToHashed covers the
+// atomic.Pointer nil-means-default behavior (mirroring
+// mc-protocol-go/models.SetCurrentNBTVersion): callers who never call
+// SetCurrentSlotComponentEncoding (e.g. existing tests that construct a
+// Slot directly with no manager involved) must keep getting the original
+// 1.21.5+ table.
+func TestSlotComponentUsesHashedTable_DefaultsToHashed(t *testing.T) {
+	prev := currentSlotComponentUsesHashedTable.Load()
+	currentSlotComponentUsesHashedTable.Store(nil)
+	defer func() { currentSlotComponentUsesHashedTable.Store(prev) }()
+
+	require.True(t, slotComponentUsesHashedTable())
+}
+
+// TestBuildContainerTypesFromRegistryEntries covers the live-registry
+// container-type fix: a server's "minecraft:menu" registry is the
+// authoritative source for container-type protocol IDs (they can and do
+// differ across versions), not the hardcoded containerTypeRegistry
+// snapshot.
+func TestBuildContainerTypesFromRegistryEntries(t *testing.T) {
+	entries := map[string]int32{
+		"minecraft:furnace":       99,  // deliberately not 14, as it is in the hardcoded snapshot
+		"minecraft:some_new_menu": 100, // no known shape yet
+	}
+	got, unknown := buildContainerTypesFromRegistryEntries(entries)
+
+	require.Len(t, got, 1)
+	info, ok := got[99]
+	require.True(t, ok)
+	require.Equal(t, "minecraft:furnace", info.Identifier)
+	require.Equal(t, 3, info.ContainerSlots)
+	require.True(t, info.IncludesPlayer)
+
+	require.Equal(t, []string{"minecraft:some_new_menu"}, unknown)
+}
+
+// TestManagerGetContainerTypeInfo_PrefersLiveRegistry covers
+// manager.getContainerTypeInfo preferring per-connection live registry data
+// over the hardcoded package-level fallback, and falling back to it when
+// the live data doesn't have an entry.
+func TestManagerGetContainerTypeInfo_PrefersLiveRegistry(t *testing.T) {
+	m := &manager{
+		liveContainerTypes: map[int32]ContainerTypeInfo{
+			14: {Identifier: "minecraft:furnace_but_remapped", ContainerSlots: 3, IncludesPlayer: true, PlayerSlotCount: 36},
+		},
+	}
+
+	info, ok := m.getContainerTypeInfo(14)
+	require.True(t, ok)
+	require.Equal(t, "minecraft:furnace_but_remapped", info.Identifier,
+		"live registry data must take priority over the hardcoded fallback")
+
+	// Type 8 (anvil in the hardcoded snapshot) isn't in this manager's live
+	// data, so it must fall back to the package-level default.
+	info, ok = m.getContainerTypeInfo(8)
+	require.True(t, ok)
+	require.Equal(t, "anvil", info.Identifier)
 }
