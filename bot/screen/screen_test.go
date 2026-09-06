@@ -407,6 +407,48 @@ func TestOnSetSlot_UsesSlotCodecWhenSet(t *testing.T) {
 	require.Equal(t, pk.VarInt(42), chest.Slots[0].ID)
 }
 
+// TestApplyServerStateID_NeverRegresses guards the fix for the race
+// documented in mc-agent's docs/bugs/craft-moveitem-remainder-lost.md:
+// ContainerClick advances m.stateID locally right after sending each click,
+// so a lagging server ack for an earlier click must never overwrite that
+// already-advanced value backward -- doing so would silently reuse a
+// stateID a later, already-sent click already declared, and the server
+// rejects that click's own state change in response.
+func TestApplyServerStateID_NeverRegresses(t *testing.T) {
+	m := &manager{stateID: 5}
+	m.applyServerStateID(3) // a lagging ack
+	require.Equal(t, int32(5), m.stateID, "a lower incoming stateID must not regress the local counter")
+
+	m.applyServerStateID(7) // a genuinely newer server state
+	require.Equal(t, int32(7), m.stateID, "a higher incoming stateID must still advance the local counter")
+}
+
+// TestOnSetSlot_DoesNotRegressStateIDBehindAnAlreadySentClick reproduces the
+// live desync from docs/bugs/craft-moveitem-remainder-lost.md: two
+// ContainerClick calls fire back-to-back (as MoveSingle does with
+// SetWaitForUpdates(false), ~170us apart in the live trace) before either is
+// acknowledged, so m.stateID is locally 2 ahead of the server's last-known
+// value by the time the first click's own ack -- which still only declares
+// the pre-second-click stateID -- arrives.
+func TestOnSetSlot_DoesNotRegressStateIDBehindAnAlreadySentClick(t *testing.T) {
+	fake := &fakeSlotCodec{}
+	client := bot.NewClient(v1_21_1.Packets{})
+	m := &manager{c: client, slotCodec: fake, inventory: NewInventory()}
+
+	require.NoError(t, m.ContainerClick(0, 1, 0, 0, nil, nil)) // declares stateID 0, local advances to 1
+	require.NoError(t, m.ContainerClick(0, 2, 0, 0, nil, nil)) // declares stateID 1, local advances to 2
+
+	// The server's ack for the *first* click only, arriving after both were
+	// already sent -- its own declared stateID (1) is genuinely stale
+	// relative to what the client has already locally predicted (2).
+	raw := []byte{0x00, 0x01, 0x00, 0x00} // containerID=0, stateID=1, slotID=0
+	require.NoError(t, m.OnSetSlot(pk.Packet{Data: raw}))
+	require.Equal(t, int32(2), m.stateID, "a lagging ack for an earlier click must not undo the second click's local advance")
+
+	require.NoError(t, m.ContainerClick(0, 3, 0, 0, nil, nil))
+	require.Equal(t, int32(2), fake.lastStateID, "the third click must declare the still-current stateID, not reuse the second click's")
+}
+
 // TestOnSetPlayerInventory_UsesSlotCodecWhenSet covers the same dispatch
 // for onSetPlayerInventory (ClientboundSetPlayerInventory).
 func TestOnSetPlayerInventory_UsesSlotCodecWhenSet(t *testing.T) {

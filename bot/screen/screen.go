@@ -610,7 +610,7 @@ func (m *manager) onSetContentPacket(p pk.Packet) error {
 	}
 
 	m.mu.Lock()
-	m.stateID = int32(stateID)
+	m.applyServerStateID(int32(stateID))
 	m.recordServerUpdate()
 	m.cursor = carriedItem
 
@@ -778,7 +778,7 @@ func (m *manager) OnSetSlot(p pk.Packet) (err error) {
 	}
 
 	m.mu.Lock()
-	m.stateID = int32(stateID)
+	m.applyServerStateID(int32(stateID))
 	m.recordServerUpdate()
 	if debugPath := os.Getenv("MC_AGENT_CLICK_DEBUG_PATH"); debugPath != "" {
 		if f, err := os.OpenFile(debugPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
@@ -847,6 +847,27 @@ func (m *manager) onSetPlayerInventory(p pk.Packet) (err error) {
 
 func (m *manager) recordServerUpdate() {
 	atomic.AddInt64(&m.serverUpdateVersion, 1)
+}
+
+// applyServerStateID updates the tracked container stateID from an incoming
+// server packet, but only ever advances it, never regresses it.
+//
+// ContainerClick optimistically bumps m.stateID locally immediately after
+// sending each click (see its comment) so back-to-back clicks fired before
+// the server acknowledges the first one still declare distinct, correct
+// stateIDs. But an incoming set_slot/set_content packet's own stateID only
+// reflects what the server had processed as of *that* packet -- it can lag
+// behind a local counter that's already been advanced by a later click sent
+// (but not yet acknowledged) in the meantime. Overwriting m.stateID
+// unconditionally with that lagging value re-exposes a stateID already
+// declared by the later click, so the server rejects that click's state
+// change and replies with a full resync (ClientboundContainerSetContent) --
+// observed live as a multi-click sequence's last click silently losing its
+// effect. Must be called with m.mu held.
+func (m *manager) applyServerStateID(stateID int32) {
+	if stateID > m.stateID {
+		m.stateID = stateID
+	}
 }
 
 func (m *manager) ServerUpdateVersion() int64 {
