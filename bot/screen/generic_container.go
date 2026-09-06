@@ -9,7 +9,17 @@ import (
 )
 
 // GenericContainer represents any container type (furnace, hopper, brewing stand, etc.)
+//
+// mu guards Slots: it's written from the network-receive goroutine
+// (OnSetSlot, on every ClientboundContainerSetSlot/ContainerSetContent
+// packet) and read from arbitrary caller goroutines concurrently - the
+// same class of race fixed for the player's own window-0 inventory type in
+// v0.2.1 (see inventory.go's doc comment), just not caught here until a
+// caller (mc-agent's crafting-table code) actually exercised it under `go
+// test -race`. Every read method below returns a defensive copy rather
+// than a slice into the live array, for the same reason inventory.go's do.
 type GenericContainer struct {
+	mu              sync.Mutex
 	Type            gomc_inventory.InventoryID
 	Title           chat.Message
 	Slots           []Slot
@@ -18,6 +28,8 @@ type GenericContainer struct {
 }
 
 func (c *GenericContainer) OnSetSlot(i int, slot Slot) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if i < 0 || i >= len(c.Slots) {
 		return errors.New("slot index out of bounds")
 	}
@@ -29,25 +41,49 @@ func (c *GenericContainer) OnClose() error {
 	return nil
 }
 
+// GetSlots returns a defensive copy of every slot in the container
+// (container-specific slots followed by the player's inventory, if
+// included) - safe to read without racing concurrent OnSetSlot writes,
+// unlike reading the Slots field directly.
+func (c *GenericContainer) GetSlots() []Slot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	slots := make([]Slot, len(c.Slots))
+	copy(slots, c.Slots)
+	return slots
+}
+
 // Container returns just the container-specific slots (e.g., 3 slots for furnace, 5 for hopper)
 func (c *GenericContainer) Container() []Slot {
-	return c.Slots[0:c.ContainerSlots]
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	slots := make([]Slot, c.ContainerSlots)
+	copy(slots, c.Slots[0:c.ContainerSlots])
+	return slots
 }
 
 // Main returns the player's main inventory slots (27 slots)
 func (c *GenericContainer) Main() []Slot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.PlayerSlotStart+27 > len(c.Slots) {
 		return nil
 	}
-	return c.Slots[c.PlayerSlotStart : c.PlayerSlotStart+27]
+	slots := make([]Slot, 27)
+	copy(slots, c.Slots[c.PlayerSlotStart:c.PlayerSlotStart+27])
+	return slots
 }
 
 // Hotbar returns the player's hotbar slots (9 slots)
 func (c *GenericContainer) Hotbar() []Slot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.PlayerSlotStart+36 > len(c.Slots) {
 		return nil
 	}
-	return c.Slots[c.PlayerSlotStart+27 : c.PlayerSlotStart+36]
+	slots := make([]Slot, 9)
+	copy(slots, c.Slots[c.PlayerSlotStart+27:c.PlayerSlotStart+36])
+	return slots
 }
 
 // ContainerTypeInfo holds metadata about a container type
