@@ -23,8 +23,17 @@ import (
 	"github.com/reallyoldfogie/mc-protocol-go/models"
 )
 
-// var PacketDebugEnabled = envBool("MC_BOT_PACKET_DEBUG")
-var PacketDebugEnabled = true
+// PacketDebugEnabled gates every inbound/outbound packet's own debug log
+// line (see its call sites below) — the single hottest logging path in
+// this client, since it fires once per packet, not once per tick. Found
+// hardcoded to true unconditionally (2026-09-09), with this env-gated
+// form already written and simply never uncommented: over any real
+// session, and especially a live RL training run's high packet-rate
+// physics-driven movement, that compounded into gigabytes of log output
+// dominating wall-clock time — see
+// github.com/reallyoldfogie/mc-agent's utils.VerboseLoggingEnabled,
+// which this mirrors for the same reason on the mc-agent side.
+var PacketDebugEnabled = envBool("MC_BOT_PACKET_DEBUG")
 
 // Client is used to access Minecraft server
 type Client interface {
