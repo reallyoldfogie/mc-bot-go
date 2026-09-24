@@ -548,3 +548,53 @@ func TestManagerGetContainerTypeInfo_PrefersLiveRegistry(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "anvil", info.Identifier)
 }
+
+// TestOnSetSlot_OpenWindowUpdatesMirrorIntoPlayerInventory guards the stale
+// inventory bug found live in mc-rsi-trainer: while a crafting table window
+// is open the server addresses the player's own slots through that window's
+// numbering and never resends window 0 on close, so a crafting-table
+// shift-click's result (server-side in hotbar slot 8) never reached
+// GetPlayerInventory and every craft looked like it had failed.
+func TestOnSetSlot_OpenWindowUpdatesMirrorIntoPlayerInventory(t *testing.T) {
+	fake := &fakeSlotCodec{decodeSlot: Slot{ID: 42, Count: 1}}
+	table := &GenericContainer{Slots: make([]Slot, 46), ContainerSlots: 10, PlayerSlotStart: 10}
+	m := &manager{
+		screens:   map[int]Container{5: table},
+		inventory: NewInventory(),
+		slotCodec: fake,
+	}
+
+	// containerID=5, stateID=1, slot=45 (window slot 45 = last hotbar slot,
+	// player inventory slot 44).
+	raw := []byte{0x05, 0x01, 0x00, 0x2d, 0x00}
+	require.NoError(t, m.OnSetSlot(pk.Packet{Data: raw}))
+
+	require.Equal(t, pk.VarInt(42), m.inventory.GetSlots()[44].ID)
+	require.Equal(t, pk.VarInt(1), m.inventory.GetSlots()[44].Count)
+
+	// A window slot in the container's own area (the grid/output) must not
+	// leak into the player inventory.
+	raw = []byte{0x05, 0x02, 0x00, 0x00, 0x00}
+	require.NoError(t, m.OnSetSlot(pk.Packet{Data: raw}))
+	require.Equal(t, pk.VarInt(0), m.inventory.GetSlots()[0].Count)
+}
+
+func TestOnSetContentPacket_OpenWindowFullSyncMirrorsIntoPlayerInventory(t *testing.T) {
+	fake := &fakeSlotCodec{decodeSlot: Slot{ID: 7, Count: 2}}
+	table := &GenericContainer{Slots: make([]Slot, 46), ContainerSlots: 10, PlayerSlotStart: 10}
+	m := &manager{
+		screens:   map[int]Container{5: table},
+		inventory: NewInventory(),
+		slotCodec: fake,
+	}
+
+	// containerID=5, stateID=1, slotCount=46, then 46 slots + carried item
+	// (all decoded by the fake, so the bytes after the header are ignored).
+	raw := append([]byte{0x05, 0x01, 46}, make([]byte, 47)...)
+	require.NoError(t, m.onSetContentPacket(pk.Packet{Data: raw}))
+
+	slots := m.inventory.GetSlots()
+	require.Equal(t, pk.VarInt(7), slots[9].ID, "first main-inventory slot")
+	require.Equal(t, pk.VarInt(7), slots[44].ID, "last hotbar slot")
+	require.Equal(t, pk.VarInt(0), slots[1].Count, "crafting grid slots of window 0 are untouched")
+}

@@ -654,6 +654,10 @@ func (m *manager) onSetContentPacket(p pk.Packet) error {
 			return Error{err}
 		}
 	}
+	if err := m.mirrorPlayerInventory(container); err != nil {
+		m.mu.Unlock()
+		return Error{err}
+	}
 	m.mu.Unlock()
 
 	// Call events after unlock
@@ -795,6 +799,9 @@ func (m *manager) OnSetSlot(p pk.Packet) (err error) {
 		err = m.inventory.OnSetSlot(int(slotID), slotData)
 	} else if c, ok := m.screens[int(containerID)]; ok {
 		err = c.OnSetSlot(int(slotID), slotData)
+		if err == nil {
+			err = m.mirrorPlayerInventory(c)
+		}
 	}
 	m.mu.Unlock()
 
@@ -1050,6 +1057,45 @@ func (s *Slot) ReadFrom(r io.Reader) (n int64, err error) {
 	}
 
 	return n, nil
+}
+
+// playerInventoryView is implemented by every screen whose window embeds
+// the player's own main-inventory and hotbar rows (Chest, GenericContainer,
+// HorseContainer). Main/Hotbar return nil or an empty slice when the window
+// has no such rows.
+type playerInventoryView interface {
+	Main() []Slot
+	Hotbar() []Slot
+}
+
+// mirrorPlayerInventory copies the player-inventory rows of an open
+// window into m.inventory. While a window other than 0 is open, the server
+// addresses the player's main/hotbar slots through that window's own slot
+// numbering, and never resends window 0 on close (the vanilla client shares
+// one Inventory object across every menu). Without this mirror, m.inventory
+// silently goes stale for anything picked up, crafted or moved while a
+// window is open - e.g. a crafting-table shift-click's result never shows
+// up in GetPlayerInventory. Caller must hold m.mu.
+func (m *manager) mirrorPlayerInventory(c Container) error {
+	v, ok := c.(playerInventoryView)
+	if !ok {
+		return nil
+	}
+	if main := v.Main(); len(main) == 27 {
+		for i, s := range main {
+			if err := m.inventory.OnSetSlot(int(MainSlotStart)+i, s); err != nil {
+				return err
+			}
+		}
+	}
+	if hotbar := v.Hotbar(); len(hotbar) == 9 {
+		for i, s := range hotbar {
+			if err := m.inventory.OnSetSlot(int(HotbarSlotStart)+i, s); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 type Container interface {

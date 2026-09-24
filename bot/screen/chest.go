@@ -31,9 +31,15 @@ func (c *Chest) Container() []Slot {
 }
 
 func (c *Chest) Main() []Slot {
+	if c.Rows*9+27 > len(c.Slots) {
+		return nil
+	}
 	return c.Slots[c.Rows*9 : c.Rows*9+27]
 }
 
 func (c *Chest) Hotbar() []Slot {
+	if (c.Rows+4)*9 > len(c.Slots) {
+		return nil
+	}
 	return c.Slots[c.Rows*9+27 : (c.Rows+4)*9]
 }
