@@ -1,6 +1,7 @@
 package screen
 
 import (
+	"fmt"
 	"bytes"
 	"encoding/binary"
 	"hash/crc32"
@@ -8,6 +9,7 @@ import (
 	"math"
 	"testing"
 
+	"github.com/Tnze/go-mc/chat"
 	pk "github.com/Tnze/go-mc/net/packet"
 	"github.com/reallyoldfogie/mc-bot-go/bot"
 	v1_21_1 "github.com/reallyoldfogie/mc-protocol-go/data/1.21.1"
@@ -619,4 +621,58 @@ func TestOnSetContentPacket_IgnoresAWindowThatIsAlreadyClosed(t *testing.T) {
 	require.Equal(t, int32(7), m.stateID, "a closed window's state ID must not overwrite ours")
 	require.Equal(t, pk.VarInt(5), m.cursor.ID, "a closed window's carried item must not overwrite our cursor")
 	require.Equal(t, pk.VarInt(2), m.cursor.Count)
+}
+
+// recordingEvents records the open/close notifications a manager emits, in order.
+type recordingEvents struct{ log []string }
+
+func (r *recordingEvents) Open(id int, _ int32, _ chat.Message) error {
+	r.log = append(r.log, fmt.Sprintf("open %d", id))
+	return nil
+}
+func (r *recordingEvents) SetSlot(int, int16) error { return nil }
+func (r *recordingEvents) Close(id int) error {
+	r.log = append(r.log, fmt.Sprintf("close %d", id))
+	return nil
+}
+
+func openScreenPacket(id, typ int) pk.Packet {
+	// The title is a network-format NBT text component: {text: "test"}.
+	title := []byte{0x0a, 0x08, 0x00, 0x04, 't', 'e', 'x', 't', 0x00, 0x04, 't', 'e', 's', 't', 0x00}
+	data := append([]byte{byte(id), byte(typ)}, title...) // id and type fit in one VarInt byte
+	return pk.Packet{ID: 0x34, Data: data}
+}
+
+// The server cycles window IDs (1-100), so an OpenScreen can name an ID we
+// still hold if we missed the old window's close. It must replace the stale
+// window, telling listeners it closed first, not fail the open and end the
+// session.
+func TestOnOpenScreen_ReusedWindowIDReplacesTheStaleWindow(t *testing.T) {
+	events := &recordingEvents{}
+	m := &manager{screens: map[int]Container{}, events: events}
+
+	require.NoError(t, m.onOpenScreen(openScreenPacket(5, 2)))
+	first := m.screens[5]
+	require.NotNil(t, first)
+
+	require.NoError(t, m.onOpenScreen(openScreenPacket(5, 2)))
+	require.NotSame(t, first, m.screens[5], "the new window must replace the stale one")
+	require.Equal(t, []string{"open 5", "close 5", "open 5"}, events.log)
+}
+
+// Closed IDs aren't remembered, so once an ID is reused, the new window's own
+// close and content are processed normally rather than ignored as stale.
+func TestOnCloseScreen_ClosesAWindowThatReusedAnEarlierID(t *testing.T) {
+	events := &recordingEvents{}
+	m := &manager{screens: map[int]Container{}, events: events, inventory: NewInventory()}
+
+	require.NoError(t, m.onOpenScreen(openScreenPacket(5, 2)))
+	require.NoError(t, m.onCloseScreen(pk.Marshal(0x12, pk.VarInt(5))))
+	require.NotContains(t, m.screens, 5)
+
+	require.NoError(t, m.onOpenScreen(openScreenPacket(5, 2)))
+	require.Contains(t, m.screens, 5)
+	require.NoError(t, m.onCloseScreen(pk.Marshal(0x12, pk.VarInt(5))))
+	require.NotContains(t, m.screens, 5, "the reused ID's close must not be treated as already closed")
+	require.Equal(t, []string{"open 5", "close 5", "open 5", "close 5"}, events.log)
 }

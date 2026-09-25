@@ -476,14 +476,11 @@ func (m *manager) onOpenScreen(p pk.Packet) error {
 		return Error{fmt.Errorf("unknown container type %d - cannot create container", TypeInt32)}
 	}
 
-	m.mu.Lock()
-	// Check if screen already exists
-	if _, ok := m.screens[int(ContainerID)]; ok {
-		m.mu.Unlock()
-		fmt.Printf("[onOpenScreen] ✗ Duplicate container ID %d (screens: %v)\n", ContainerID, getScreenIDs(m.screens))
-		return errors.New("container id already exists in screens")
+	if err := m.evictStaleWindow(int(ContainerID)); err != nil {
+		return err
 	}
 
+	m.mu.Lock()
 	// Create appropriate container based on type
 	if TypeInt32 < 6 {
 		// Types 0-5 are chest variants - use the specialized Chest type for backward compatibility
@@ -556,11 +553,11 @@ func (m *manager) onOpenHorseScreen(p pk.Packet) error {
 		PlayerSlotStart: containerSlots,
 	}
 
-	m.mu.Lock()
-	if _, ok := m.screens[int(WindowID)]; ok {
-		m.mu.Unlock()
-		return errors.New("container id already exists in screens")
+	if err := m.evictStaleWindow(int(WindowID)); err != nil {
+		return err
 	}
+
+	m.mu.Lock()
 	m.screens[int(WindowID)] = &horseContainer
 	m.mu.Unlock()
 
@@ -680,6 +677,45 @@ func (m *manager) onSetContentPacket(p pk.Packet) error {
 			if err := m.events.SetSlot(int(containerID), int16(i)); err != nil {
 				return Error{err}
 			}
+		}
+	}
+	return nil
+}
+
+// evictStaleWindow closes the window recorded under id, if any, so a new
+// window can take that ID.
+//
+// The server hands out window IDs from a small cycling range (1-100 in
+// vanilla) and only ever opens a window under an ID it has finished with, so
+// an OpenScreen for an ID we still hold means we missed the close: the client
+// closed the window itself without ForceCloseScreen, or the close packet was
+// lost. The new window is the truth; failing the open would end the session
+// over a window nobody is using any more. The stale window gets its normal
+// close notifications first so listeners drop it before hearing about the new
+// one. Closed IDs are not remembered anywhere, so the new window's own close,
+// and its content packets, are handled normally.
+func (m *manager) evictStaleWindow(id int) error {
+	if id == 0 {
+		return errors.New("window id 0 is the player inventory")
+	}
+
+	m.mu.Lock()
+	stale, ok := m.screens[id]
+	if ok {
+		delete(m.screens, id)
+	}
+	m.mu.Unlock()
+	if !ok {
+		return nil
+	}
+
+	fmt.Printf("[screen] window id %d reopened while the previous window was still open; closing the stale one\n", id)
+	if err := stale.OnClose(); err != nil {
+		return Error{err}
+	}
+	if m.events != nil {
+		if err := m.events.Close(id); err != nil {
+			return Error{err}
 		}
 	}
 	return nil

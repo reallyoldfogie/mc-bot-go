@@ -90,32 +90,23 @@ func TestOnOpenHorseScreen(t *testing.T) {
 	}
 }
 
-func TestOnOpenHorseScreen_DuplicateWindowID(t *testing.T) {
+// A window ID the client still holds means it missed the close; the new
+// window replaces the stale one instead of failing the open.
+func TestOnOpenHorseScreen_ReusedWindowIDReplacesTheStaleWindow(t *testing.T) {
 	mgr := &manager{
 		screens: make(map[int]Container),
 		events:  nil,
 	}
 
-	// Create first horse screen
-	packet1 := pk.Marshal(
-		0x28,
-		pk.Byte(1),
-		pk.VarInt(2),
-		pk.Int(100),
-	)
-	err := mgr.onOpenHorseScreen(packet1)
-	require.NoError(t, err)
+	packet1 := pk.Marshal(0x28, pk.Byte(1), pk.VarInt(2), pk.Int(100))
+	require.NoError(t, mgr.onOpenHorseScreen(packet1))
 
-	// Try to create second horse screen with same window ID
-	packet2 := pk.Marshal(
-		0x28,
-		pk.Byte(1), // Same window ID
-		pk.VarInt(17),
-		pk.Int(200),
-	)
-	err = mgr.onOpenHorseScreen(packet2)
-	require.Error(t, err, "should error on duplicate window ID")
-	assert.Contains(t, err.Error(), "already exists", "error should mention duplicate")
+	packet2 := pk.Marshal(0x28, pk.Byte(1), pk.VarInt(17), pk.Int(200)) // same window ID
+	require.NoError(t, mgr.onOpenHorseScreen(packet2))
+
+	horse, ok := mgr.screens[1].(*HorseContainer)
+	require.True(t, ok)
+	assert.Equal(t, int32(200), horse.EntityID, "the new window must be the one recorded")
 }
 
 func TestHorseContainer_SetSlot(t *testing.T) {
