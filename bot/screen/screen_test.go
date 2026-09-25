@@ -598,3 +598,25 @@ func TestOnSetContentPacket_OpenWindowFullSyncMirrorsIntoPlayerInventory(t *test
 	require.Equal(t, pk.VarInt(7), slots[44].ID, "last hotbar slot")
 	require.Equal(t, pk.VarInt(0), slots[1].Count, "crafting grid slots of window 0 are untouched")
 }
+
+// TestOnSetContentPacket_IgnoresAWindowThatIsAlreadyClosed guards the live
+// crash: the server sent ClientboundContainerSetContent for a crafting-table
+// window ~50ms after this client closed it, which returned an error and ended
+// the whole bot session (and, in rsi-train, the entire run). It must be
+// ignored, and its stale state ID and carried item must not touch our state.
+func TestOnSetContentPacket_IgnoresAWindowThatIsAlreadyClosed(t *testing.T) {
+	m := &manager{
+		screens:   map[int]Container{}, // window 13 was opened, then closed
+		inventory: NewInventory(),
+		stateID:   7,
+		cursor:    Slot{ID: 5, Count: 2},
+	}
+
+	// containerID=13, stateID=99, slotCount=1, one empty slot, carried item empty.
+	raw := []byte{0x0d, 0x63, 0x01, 0x00, 0x00}
+	require.NoError(t, m.onSetContentPacket(pk.Packet{Data: raw}))
+
+	require.Equal(t, int32(7), m.stateID, "a closed window's state ID must not overwrite ours")
+	require.Equal(t, pk.VarInt(5), m.cursor.ID, "a closed window's carried item must not overwrite our cursor")
+	require.Equal(t, pk.VarInt(2), m.cursor.Count)
+}

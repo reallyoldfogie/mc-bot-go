@@ -610,6 +610,19 @@ func (m *manager) onSetContentPacket(p pk.Packet) error {
 	}
 
 	m.mu.Lock()
+	// A content packet for a window this client has already closed is normal:
+	// the server can still be sending updates for it when our close goes out
+	// (found live: a crafting-table window closed 50ms before its late
+	// ContainerSetContent arrived, which used to be an error and ended the
+	// whole bot session). Ignore it, without letting its stale state ID or
+	// carried item touch our own state, like the vanilla client ignores
+	// packets for a menu that isn't open.
+	if containerID != 0 {
+		if _, open := m.screens[int(containerID)]; !open {
+			m.mu.Unlock()
+			return nil
+		}
+	}
 	m.applyServerStateID(int32(stateID))
 	m.recordServerUpdate()
 	m.cursor = carriedItem
@@ -643,8 +656,9 @@ func (m *manager) onSetContentPacket(p pk.Packet) error {
 
 	container, ok := m.screens[int(containerID)]
 	if !ok {
+		// Unreachable: the open-window check above ran under the same lock.
 		m.mu.Unlock()
-		return Error{errors.New("setting content of non-exist container")}
+		return nil
 	}
 
 	for i, v := range slotData {
